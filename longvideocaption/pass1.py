@@ -710,7 +710,7 @@ def _apply_prev_event_revision(chunk_data: dict, global_results: list, video_tag
     )
 
 
-def _enforce_event_continuity(events: list, video_tag: str, stats: Optional[dict] = None) -> None:
+def _enforce_event_continuity(events: list, video_tag: str, stats: Optional[dict] = None, chunk_start: float = 0.0) -> None:
     """按 start_time 排序后扫一遍，修平相邻 event 的 overlap / gap。
 
     必须在 _validate_and_snap_event_times 之后调用（事件时间已 snap 到白名单）。
@@ -718,12 +718,24 @@ def _enforce_event_continuity(events: list, video_tag: str, stats: Optional[dict
     drop 引入新的 non-adjacent overlap。
     - nxt.start < last_valid.end → overlap，吸附 nxt.start = last_valid.end
     - nxt.start > last_valid.end + 0.01 → gap，吸附 nxt.start = last_valid.end
-    - 调整后 nxt.start >= nxt.end → 丢弃该 nxt（last_valid 不变）。
+    - 调整后 nxt.start >= nxt.end - 0.5 → 丢弃该 nxt（last_valid 不变）。
+    - 若 chunk_start ≈ 0 且首 event.start > 0，吸附至 chunk_start（填补视频开头空隙）。
     """
-    if not events or len(events) < 2:
+    if not events:
         return
 
     events.sort(key=lambda ev: parse_timestamp_to_seconds(ev.get("start_time", "")))
+
+    if chunk_start <= 0.01:
+        first_ev = events[0]
+        first_start_sec = parse_timestamp_to_seconds(first_ev.get("start_time", ""))
+        if first_start_sec > 0.01:
+            new_start = format_timestamp(chunk_start)
+            _log(video_tag, f"  ⚠️ [事件连续性] events[0].start={first_ev.get('start_time')} 晚于视频起点，吸附至 {new_start}")
+            first_ev["start_time"] = new_start
+
+    if len(events) < 2:
+        return
 
     drop_indices = set()
     last_valid_idx = None
@@ -817,13 +829,22 @@ def _enforce_cross_chunk_continuity(
             drop_indices.append(idx)
             continue
         if start_sec < prev_end_sec - 0.01:
+            ev["start_time"] = prev_end_str
+            if end_sec - prev_end_sec < 0.5:
+                _record_validation_stat(stats, "dropped_overlap_count")
+                _log(
+                    video_tag,
+                    f"  ⚠️ [跨段连续性] events[{idx}]={ev.get('start_time')}-{ev.get('end_time')} "
+                    f"吸附后剩余时长不足 ({end_sec - prev_end_sec:.2f}s)，丢弃",
+                )
+                drop_indices.append(idx)
+                continue
             _record_validation_stat(stats, "cross_chunk_snap_count")
             _log(
                 video_tag,
                 f"  ⚠️ [跨段连续性] events[{idx}].start={ev.get('start_time')} 早于上段末 "
                 f"{prev_end_str}，吸附",
             )
-            ev["start_time"] = prev_end_str
         elif start_sec > prev_end_sec + 0.01:
             _record_validation_stat(stats, "cross_chunk_snap_count")
             _log(
@@ -1166,10 +1187,16 @@ def run_pass1(
             prompt_timestamps_str_list = sorted(set(frame_prompt_timestamps_str), key=_timestamp_sort_key)
             start_str = _format_pass1_storage_timestamp(chunk_start, cfg)
             prompt_start_str = _format_pass1_prompt_timestamp(chunk_start, cfg)
+            end_str = _format_pass1_storage_timestamp(chunk_end, cfg)
+            prompt_end_str = _format_pass1_prompt_timestamp(chunk_end, cfg)
             if start_str not in timestamps_str_list:
                 timestamps_str_list.insert(0, start_str)
             if prompt_start_str not in prompt_timestamps_str_list:
                 prompt_timestamps_str_list.insert(0, prompt_start_str)
+            if end_str not in timestamps_str_list:
+                timestamps_str_list.append(end_str)
+            if prompt_end_str not in prompt_timestamps_str_list:
+                prompt_timestamps_str_list.append(prompt_end_str)
 
         timestamps_str = ", ".join(prompt_timestamps_str_list)
 
@@ -1218,7 +1245,7 @@ def run_pass1(
                     video_tag,
                     confidence_stats,
                 )
-                _enforce_event_continuity(chunk_data.get("events", []), video_tag, confidence_stats)
+                _enforce_event_continuity(chunk_data.get("events", []), video_tag, confidence_stats, chunk_start)
 
                 _validate_revision_end_time(
                     chunk_data.get("prev_event_revision"),
@@ -1238,7 +1265,7 @@ def run_pass1(
                     video_tag,
                     confidence_stats,
                 )
-                _enforce_event_continuity(chunk_data.get("events", []), video_tag, confidence_stats)
+                _enforce_event_continuity(chunk_data.get("events", []), video_tag, confidence_stats, chunk_start)
 
                 events = chunk_data.get("events", [])
 

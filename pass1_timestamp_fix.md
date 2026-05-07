@@ -62,7 +62,7 @@ LLM 返回 chunk_data
 
 **白名单来源**：
 - scenedetect 模式：整个 chunk 内的镜头切换时间点 + `chunk_start` + `chunk_end`（+ 重叠模式下的 `last_end_str`）
-- 非 scenedetect 模式：抽帧时间戳 + `chunk_start`
+- 非 scenedetect 模式：抽帧时间戳 + `chunk_start` + `chunk_end`
 
 **处理逻辑**（对每个 event 顺序执行）：
 
@@ -103,11 +103,14 @@ g. 检查 key_frame_times 是否在 [start, end] 范围内，越界 WARN
 
 ### [3] `_enforce_event_continuity`（第 1 次，chunk 内）
 
+**签名**：`(events, video_tag, stats, chunk_start=0.0)`
+
 **目的**：修平 chunk 内相邻 event 的 overlap 和 gap，保证 `events[i+1].start == events[i].end`。
 
 **处理流程**：
 
 ```
+Step 0: 若 chunk_start ≈ 0 且首 event.start > 0 → 吸附至 chunk_start（填补视频开头空隙）
 Step 1: 按 start_time 升序排列
 Step 2: last_valid_idx = 0（第一个 event 作为锚点）
 Step 3: 遍历 i = 1..n-1:
@@ -128,6 +131,8 @@ Step 3: 遍历 i = 1..n-1:
     否则:
         last_valid_idx = i
 ```
+
+**首 event 视频起点吸附**：仅在首个 chunk（`chunk_start ≤ 0.01`）且首 event 的 start 晚于 0 时触发，将 start 吸附至 `"00:00:00.000"`。单 event chunk 也会被处理。
 
 **关键设计：`last_valid_idx` 在丢弃时不更新**
 
@@ -207,7 +212,9 @@ Step 3: 遍历当前 chunk events:
         → 丢弃该 event，继续下一个
     
     ev.start < prev_end（overlap）:
-        → ev.start = prev_end（吸附当前 event 起点），继续下一个
+        → ev.start = prev_end（吸附当前 event 起点）
+        → 吸附后若 end - prev_end < 0.5s，丢弃该 event，继续下一个
+        → 否则保留，继续下一个（后续 event 可能也重叠）
     
     ev.start > prev_end（gap）:
         → prev_events[-1].end_time = ev.start（延展前段末 event），停止遍历
@@ -221,6 +228,7 @@ Step 3: 遍历当前 chunk events:
 | 情况 | 操作方向 | 原因 |
 |------|---------|------|
 | overlap | 当前 event ← 前段 | 当前 event 开始过早，属于模型错误 |
+| overlap 后过短 | 丢弃当前 event | 吸附后 duration < 0.5s，继续检查下一个 |
 | gap | 前段 → 当前 event | 前段 event 结束不够晚，延展它比回拉当前 event 更尊重 LLM 意图 |
 
 ---
@@ -228,6 +236,19 @@ Step 3: 遍历当前 chunk events:
 ### [7] `_enforce_event_continuity`（第 2 次）
 
 与 [3] 完全相同的逻辑。因跨 chunk 修平或合并可能改变当前 chunk events 的状态（start 被吸附、event 被丢弃），再跑一次确保 chunk 内连续性。
+
+---
+
+## Gap / Overlap 防漏矩阵
+
+经过全部 7 步后处理，各位置的 gap 和 overlap 覆盖如下：
+
+| 位置 | 处理步骤 | overlap | gap | 丢弃后衔接 |
+|------|---------|---------|-----|-----------|
+| 视频开头（0s） | [3] / [7] | — | snap 首 event.start → 0 | — |
+| Chunk 内相邻 event | [3] / [7] | snap nxt.start → cur.end | snap nxt.start → cur.end | last_valid 不变，下个 event 衔接 |
+| Chunk 边界 | [6] | snap ev.start → prev_end；吸附后 duration < 0.5s 则丢弃并继续检查下一个 | 延展 prev_events[-1].end → ev.start | 完全被覆盖则丢弃；吸附后过短则丢弃继续 |
+| 视频末尾 | confidence | — | — | 仅检测不修复（`is_fully_covered` / `gaps`） |
 
 ---
 
@@ -269,7 +290,7 @@ LLM 输出（可能为 qwen 秒格式 / 裸数字 / 标准格式）
 │   修订前段末 event 的 end_time + caption
 │
 ▼ [6] 跨 chunk 连续性
-│   overlap: ev.start → prev_end
+│   overlap: ev.start → prev_end（吸附后 duration < 0.5s 则丢弃）
 │   gap:     prev_end → ev.start
 │
 ▼ [7] chunk 内连续性（二次）
