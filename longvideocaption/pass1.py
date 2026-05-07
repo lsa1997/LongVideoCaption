@@ -241,11 +241,11 @@ def _validate_and_snap_event_times(
     """就地校验 events 的 start_time/end_time，把非白名单值 snap 到最近的合法项。
 
     - 白名单为空 → 直接跳过
-    - 非白名单 → snap 到最近项（Δ>1.5s 记 WARN，否则 INFO）
+    - 非白名单 → snap 到最近项（Δ>60s 记大偏移 WARN）
     - start > end → swap
-    - end - start < 0.1s → 丢弃该 event
-    - 越出 chunk 边界 > 0.5s → clamp 到 chunk 内最近白名单
-    - key_frame_times 仅 WARN 不 snap
+    - end - start < 0.5s → 丢弃该 event（保证 stage2 按 fps 4 至少采 2 帧）
+    - 越出 chunk 边界 > 0.5s → clamp 到 chunk 边界
+    - key_frame_times 仅 WARN 不 snap，支持 str/int/float
     """
     if not whitelist_str_list or not events:
         return
@@ -275,7 +275,10 @@ def _validate_and_snap_event_times(
                 nearest_str, nearest_sec = wl_str, wl_sec
         delta = nearest_dist
         _record_large_snap_delta(stats, delta, label)
-        _log(video_tag, f"  ⚠️ [时间戳校准] {label}={ts_str} → {nearest_str} (Δ={delta:.2f}s)")
+        if delta > 60.0:
+            _log(video_tag, f"  ⚠️ [时间戳校准·大偏移] {label}={ts_str} → {nearest_str} (Δ={delta:.1f}s，白名单过疏？)")
+        else:
+            _log(video_tag, f"  ⚠️ [时间戳校准] {label}={ts_str} → {nearest_str} (Δ={delta:.2f}s)")
         return nearest_str, nearest_sec
 
     def _clamp_left(cur_str: str, cur_sec: float) -> Tuple[str, float]:
@@ -285,7 +288,8 @@ def _validate_and_snap_event_times(
             if sv >= chunk_start - 0.1:
                 _log(video_tag, f"  ⚠️ [时间戳校准] start={cur_str} 越出 chunk 左界 {chunk_start:.2f}s，clamp 至 {s}")
                 return s, sv
-        return cur_str, cur_sec
+        _log(video_tag, f"  ⚠️ [时间戳校准] start={cur_str} 越出 chunk 左界，无合适白名单点，clamp 至 chunk_start")
+        return format_timestamp(chunk_start), chunk_start
 
     def _clamp_right(cur_str: str, cur_sec: float) -> Tuple[str, float]:
         if cur_sec <= chunk_end + 0.5:
@@ -294,7 +298,8 @@ def _validate_and_snap_event_times(
             if sv <= chunk_end + 0.1:
                 _log(video_tag, f"  ⚠️ [时间戳校准] end={cur_str} 越出 chunk 右界 {chunk_end:.2f}s，clamp 至 {s}")
                 return s, sv
-        return cur_str, cur_sec
+        _log(video_tag, f"  ⚠️ [时间戳校准] end={cur_str} 越出 chunk 右界，无合适白名单点，clamp 至 chunk_end")
+        return format_timestamp(chunk_end), chunk_end
 
     drop_indices = []
     for idx, ev in enumerate(events):
@@ -313,8 +318,8 @@ def _validate_and_snap_event_times(
             start_str, end_str = end_str, start_str
             start_sec, end_sec = end_sec, start_sec
 
-        if end_sec - start_sec < 0.1:
-            _log(video_tag, f"  ⚠️ [时间戳校准] event[{idx}] Δ={end_sec - start_sec:.3f}s < 0.1s，丢弃")
+        if end_sec - start_sec < 0.5:
+            _log(video_tag, f"  ⚠️ [时间戳校准] event[{idx}] Δ={end_sec - start_sec:.3f}s < 0.5s，丢弃")
             _record_validation_stat(stats, "dropped_too_short_count")
             drop_indices.append(idx)
             continue
@@ -326,10 +331,13 @@ def _validate_and_snap_event_times(
         ev["end_time"] = end_str
 
         for kft in ev.get("key_frame_times", []):
-            if not isinstance(kft, str):
+            if isinstance(kft, (int, float)):
+                kft_sec = float(kft)
+            elif isinstance(kft, str):
+                kft_sec = parse_timestamp_to_seconds(kft)
+            else:
                 continue
-            kft_sec = parse_timestamp_to_seconds(kft)
-            if not (start_sec - 0.1 <= kft_sec <= end_sec + 0.1):
+            if kft_sec is not None and not (start_sec - 0.1 <= kft_sec <= end_sec + 0.1):
                 _log(
                     video_tag,
                     f"  ⚠️ [时间戳校准] event[{idx}].key_frame_times={kft} "
@@ -750,11 +758,11 @@ def _enforce_event_continuity(events: list, video_tag: str, stats: Optional[dict
             nxt["start_time"] = cur_end_str
             nxt_start_sec = cur_end_sec
 
-        if nxt_start_sec >= nxt_end_sec - 0.01:
+        if nxt_start_sec >= nxt_end_sec - 0.5:
             _log(
                 video_tag,
-                f"  ⚠️ [事件连续性] events[{i}] 调整后 start>=end "
-                f"({nxt_start_sec:.2f}s >= {nxt_end_sec:.2f}s)，丢弃",
+                f"  ⚠️ [事件连续性] events[{i}] 调整后剩余时长不足 "
+                f"(start={nxt_start_sec:.2f}s, end={nxt_end_sec:.2f}s)，丢弃",
             )
             _record_validation_stat(stats, "dropped_overlap_count")
             drop_indices.add(i)
@@ -771,9 +779,12 @@ def _enforce_cross_chunk_continuity(
     video_tag: str,
     stats: Optional[dict] = None,
 ) -> None:
-    """跨 chunk 兜底：若当前 chunk events[0] 起点早于上段末 event 终点，吸附或丢弃。
+    """跨 chunk 兜底，修平相邻 chunk 之间 event 的 overlap / gap。
 
     从 global_results 末尾回溯，找到最后一个包含 events 的 chunk 作为"上段"进行比对。
+    - overlap（events[idx].start < prev_end）：吸附当前 event 的 start 至 prev_end
+    - gap（events[idx].start > prev_end）：延展上段末 event 的 end_time 至当前 event 的 start
+    - 完全在上段范围内的 event 直接丢弃
     """
     if not current_events:
         return
@@ -813,6 +824,15 @@ def _enforce_cross_chunk_continuity(
                 f"{prev_end_str}，吸附",
             )
             ev["start_time"] = prev_end_str
+        elif start_sec > prev_end_sec + 0.01:
+            _record_validation_stat(stats, "cross_chunk_snap_count")
+            _log(
+                video_tag,
+                f"  ⚠️ [跨段连续性] events[{idx}].start={ev.get('start_time')} 晚于上段末 "
+                f"{prev_end_str}（gap={start_sec - prev_end_sec:.2f}s），延展上段末 event end_time 填充",
+            )
+            prev_events[-1]["end_time"] = ev.get("start_time")
+            break
         else:
             break
 
@@ -882,21 +902,26 @@ _QWEN_HYBRID_STRIP_RE = re.compile(r"\s*<?\s*seconds\s*>?\s*$", re.IGNORECASE)
 _QWEN_MILLI_PAD_RE = re.compile(r"\.(\d{1,2})$")
 
 
-def _canonicalize_qwen_timestamp(ts_str: str) -> str:
+def _canonicalize_qwen_timestamp(ts) -> str:
+    # 0. Handle float/int directly (Qwen may output bare numbers)
+    if isinstance(ts, (int, float)):
+        return format_timestamp(float(ts))
+    if not isinstance(ts, str):
+        return str(ts)
     # 1. Try pure qwen format: "12.5 seconds" / "<12.5 seconds>" / "12.5"
-    qwen_sec = _parse_qwen_timestamp(ts_str)
+    qwen_sec = _parse_qwen_timestamp(ts)
     if qwen_sec is not None:
         return format_timestamp(qwen_sec)
 
     # 2. Strip trailing "seconds" suffix for hybrid formats like "00:02:31.1 seconds"
-    cleaned = _QWEN_HYBRID_STRIP_RE.sub("", ts_str.strip())
+    cleaned = _QWEN_HYBRID_STRIP_RE.sub("", ts.strip())
     # 3. Pad milliseconds to 3 digits: "00:02:31.1" → "00:02:31.100"
     cleaned = _QWEN_MILLI_PAD_RE.sub(lambda m: f".{m.group(1):0<3}", cleaned)
 
     strict_sec = parse_timestamp_to_seconds_strict(cleaned)
     if strict_sec is not None:
         return format_timestamp(strict_sec)
-    return ts_str
+    return ts
 
 
 def _normalize_qwen_output_timestamps(chunk_data: dict, video_tag: str) -> None:
@@ -908,7 +933,7 @@ def _normalize_qwen_output_timestamps(chunk_data: dict, video_tag: str) -> None:
         nonlocal changed
         if isinstance(value, dict):
             for key, child in list(value.items()):
-                if key in timestamp_keys and isinstance(child, str):
+                if key in timestamp_keys and isinstance(child, (str, int, float)):
                     new_child = _canonicalize_qwen_timestamp(child)
                     if new_child != child:
                         changed += 1
@@ -916,7 +941,7 @@ def _normalize_qwen_output_timestamps(chunk_data: dict, video_tag: str) -> None:
                 elif key == "key_frame_times" and isinstance(child, list):
                     new_list = []
                     for item in child:
-                        if isinstance(item, str):
+                        if isinstance(item, (str, int, float)):
                             new_item = _canonicalize_qwen_timestamp(item)
                             if new_item != item:
                                 changed += 1
@@ -1065,6 +1090,8 @@ def run_pass1(
 
     while chunk_start < total_duration:
         chunk_end = min(chunk_start + cfg.chunk_duration_sec, total_duration)
+        if chunk_end >= total_duration - 0.01:
+            chunk_end = total_duration
         chunk_name = f"[{_format_pass1_prompt_timestamp(chunk_start, cfg)} - {_format_pass1_prompt_timestamp(chunk_end, cfg)}]"
         log_tag = f"[{video_tag}] {chunk_name}" if video_tag else chunk_name
         _log(video_tag, f"\n=========================================")
@@ -1323,7 +1350,7 @@ def run_pass1(
             prompt_next = _format_pass1_prompt_timestamp(next_start, cfg)
             previous_context = f"【系统提示】: 上一片段解析异常，请直接从 {prompt_next} 开始重新捕捉动作。"
 
-        if chunk_end >= total_duration - 0.01:
+        if chunk_end == total_duration:
             _log(video_tag, f"🏁 已处理到视频末尾 ({format_timestamp(total_duration)})，Pass 1 结束。")
             break
 
