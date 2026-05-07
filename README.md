@@ -78,26 +78,35 @@ flowchart TB
 
     Loop -->|"yes"| Whitelist["从全片 scene 列表抽取<br/>落在 [chunk_start, chunk_end] 内的镜头切换点<br/>并加入 chunk_start/chunk_end<br/>作为 timestamps_whitelist"]
     Whitelist --> Extract["抽帧<br/>scenedetect 复用全片结果 + get_base64_frames<br/>或 video_base64 整段"]
-    Extract --> Build["拼 prompt<br/>sys + 前情提要 + 角色滚动史 + 帧序列 + 白名单"]
-    Build --> LLM["LLM 多模态调用<br/>JSON 严格输出，event 起止必须取自白名单"]
-    LLM --> Parse["解析 events、chunk_summary、characters_in_chunk"]
-    Parse --> Snap["_validate_and_snap_event_times<br/>把模型输出 snap 到最近的白名单点"]
-    Snap --> Revise["prev_event_revision<br/>跨 chunk 截断动作合并"]
-    Revise --> Relay{"动态接力<br/>5 ≤ last_end_sec ≤ chunk_end+10 ?"}
-    Relay -->|"yes"| NextEnd["chunk_start = last_end"]
-    Relay -->|"no"| Overlap["chunk_start = chunk_end - 20%重叠"]
-    NextEnd --> Append["追加到 pass1_progress.json"]
-    Overlap --> Append
+    Extract --> Build["拼 prompt<br/>sys + 前情提要 + 视觉重叠区间 + 帧序列 + 白名单"]
+    Build --> LLMLoop{"LLM 多模态调用<br/>+ 内容重试循环<br/>(max_retries 次)"}
+    LLMLoop -->|"events + merge 均为空"| Retry["重试"]
+    Retry --> LLMLoop
+    LLMLoop -->|"有 events<br/>或 prev_event_revision"| Validate["时间戳校验 + chunk 内/跨 chunk 连续性修平<br/>（跨 chunk 操作统一回溯找到最后含 events 的 chunk）"]
+    Validate --> Revise{"prev_event_revision<br/>need_merge?"}
+    Revise -->|"是"| Merge["合并至前段末尾 event<br/>当前 chunk 标记 merged=true"]
+    Revise -->|"否"| HasEvents{"有 events?"}
+    Merge --> HasEvents
+    HasEvents -->|"有"| NextStart["动态接力<br/>按 overlap_count 回退<br/>cap 于 max_overlap_duration_sec"]
+    HasEvents -->|"空（合并后）"| MergedNext["从前段修订后 event 算 next_start<br/>+ min_chunk_advance_sec 推进保护"]
+    HasEvents -->|"空（非合并）"| Fallback["80% 兜底推进"]
+    NextStart --> Append["追加到 pass1_progress.json"]
+    MergedNext --> Append
+    Fallback --> Append
     Append --> Loop
 
-    Loop -->|"done"| Out(["pass1_progress.json<br/>chunks 数组、每个含 data.events 列表<br/>pass1_confidence.json"])
+    Loop -->|"done"| Out(["pass1_progress.json<br/>chunks 数组（merged chunk events 为空）<br/>pass1_confidence.json"])
 ```
 
 **关键不变量**：
 - events **首尾相连**逐字相等（`events[i+1].start_time == events[i].end_time`），由 prompt 强制约束。
 - 整片只跑一次 `pyscenedetect.detect`（`frame_extractor.detect_scenes`），结果在所有 chunk 间复用 —— 避免 N× 重复扫描。
 - `timestamps_whitelist` 来自当前 chunk 内的镜头切换时间点，并显式包含 `chunk_start` / `chunk_end`；重叠接力时还会加入上一段 `last_end`，确保模型只能选择可校验的边界。
-- `pass1_confidence.json` 记录事件时间轴覆盖、相邻 event 连续性、后处理修补/丢弃统计、event 时长分布、内容缺失、关键帧越界和时间戳吸附偏移。
+- **内容重试**：若 LLM 返回合法 JSON 但 `events` 为空且未触发 `prev_event_revision` 合并，则在同一 chunk 上重试（最多 `max_retries` 次），而非直接走 80% 兜底推进。
+- **跨 chunk 合并**：模型通过 `prev_event_revision`（含 `need_merge=true` + 修订后的 `end_time` / `step1` / `step2` / `step3`）将当前 chunk 的内容完整合并到前段末尾 event。合并后当前 chunk 标记 `merged: true`，其 `events` 为空。**支持单一 event 跨越 2 个以上 chunk 的连续合并**，所有跨 chunk 操作（revision 应用、连续性检查、断点恢复）均会回溯跳过 `merged` chunk，找到最后一个含 events 的 chunk 进行比对。
+- **前情提要时长上限**：视觉重叠区间的回退时长受 `max_overlap_duration_sec`（默认 30s）限制，超出部分被截断。
+- **合并后推进保护**：合并后 `next_start` 若推进不足 `min_chunk_advance_sec`（默认 5s），则强制推进到 `chunk_start + min_chunk_advance_sec`，避免死循环。
+- `pass1_confidence.json` 记录事件时间轴覆盖、相邻 event 连续性、后处理修补/丢弃统计、event 时长分布、内容缺失、关键帧越界和时间戳吸附偏移；`event_content_health` 统计会跳过 `merged` chunk。
 
 ---
 
@@ -403,7 +412,9 @@ python main.py \
 
 `--hyper-sig` 仅在 `--stage2-only` 或 `--stage3-only` 时生效。不提供时系统自动扫描前序目录。
 
-进阶超参（Stage 2/3 的 fps、max_frames、temperature、max_tokens 等）在 `longvideocaption/config.py` 的 `PipelineConfig` 里改默认值。Stage 2 并行相关参数包括 `stage2_parallel_max_workers`（非 qwen 最大并行请求数，默认 `4`）、`stage2_qwen_parallel_max_workers`（qwen 线程池安全上限，默认 `32`）和 `stage2_qwen_parallel_visual_token_budget`（qwen 同时在飞请求的视觉 token 预算，默认 `128 * 1024`）。
+进阶超参（Stage 2/3 的 fps、max_frames、temperature、max_tokens 等）在 `longvideocaption/config.py` 的 `PipelineConfig` 里改默认值。Stage 2 并行相关参数包括 `stage2_parallel_max_workers`（非 qwen 最大并行请求数，默认 `4`）、`stage2_qwen_parallel_max_workers`（qwen 线程池安全上限，默认 `32`）和 `stage2_qwen_parallel_visual_token_budget`（qwen 同时在飞请求的视觉 token 预算，默认 `160 * 1024`）。
+
+Pass 1 相关进阶参数：`prev_event_overlap_count`（前情提要覆盖的末尾 event 个数，默认 `1`）、`max_overlap_duration_sec`（前情提要最大时长秒数，超过则截断，默认 `30.0`）、`min_chunk_advance_sec`（合并后 chunk_start 最小推进秒数，防止死循环，默认 `5.0`）。
 
 ---
 

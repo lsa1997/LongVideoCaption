@@ -25,6 +25,8 @@ class PipelineConfig:
     llm_temperature: float = 0.2
     llm_max_tokens: int = 32768
     prev_event_overlap_count: int = 1
+    max_overlap_duration_sec: float = 30.0
+    min_chunk_advance_sec: float = 5.0
 
     pass2_temperature: float = 0.1
     pass2_max_tokens: int = 32768

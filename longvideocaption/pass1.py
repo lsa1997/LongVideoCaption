@@ -184,7 +184,23 @@ def _pick_next_start(
     if proposed <= current_chunk_start + 1.0:
         return last_end_sec, last_end_str, last_action, False, 0
 
+    max_overlap = float(cfg.max_overlap_duration_sec)
+    overlap_duration = last_end_sec - proposed
+    if overlap_duration > max_overlap:
+        proposed = last_end_sec - max_overlap
+
     return proposed, last_end_str, last_action, True, k
+
+
+def _filter_overlap_events(events: list, overlap_start: float, overlap_end: float) -> list:
+    """从 events 中筛选落在 [overlap_start, overlap_end] 时间窗口内的事件（用于前情提要）。"""
+    result = []
+    for ev in events:
+        start_sec = parse_timestamp_to_seconds(ev.get("start_time", ""))
+        end_sec = parse_timestamp_to_seconds(ev.get("end_time", ""))
+        if end_sec > overlap_start - 0.01 and start_sec < overlap_end + 0.01:
+            result.append(ev)
+    return result
 
 
 def _record_large_snap_delta(stats: Optional[dict], delta: float, label: str) -> None:
@@ -466,6 +482,8 @@ def _compute_event_content_health(global_results: list) -> dict:
         "empty_characters_in_chunk_count": 0,
     }
     for chunk in global_results:
+        if chunk.get("merged"):
+            continue
         data = chunk.get("data", {}) or {}
         if not data.get("characters_in_chunk"):
             health["empty_characters_in_chunk_count"] += 1
@@ -620,9 +638,14 @@ def _apply_prev_event_revision(chunk_data: dict, global_results: list, video_tag
         _log(video_tag, "⚠️ [修订跳过] 无上段 chunk 可供修订，忽略 prev_event_revision")
         return
 
-    prev_events = (global_results[-1].get("data") or {}).get("events", [])
+    prev_events = []
+    for c in reversed(global_results):
+        evts = (c.get("data") or {}).get("events", [])
+        if evts:
+            prev_events = evts
+            break
     if not prev_events:
-        _log(video_tag, "⚠️ [修订跳过] 上段 chunk 无 events，忽略 prev_event_revision")
+        _log(video_tag, "⚠️ [修订跳过] 未找到含 events 的上段 chunk，忽略 prev_event_revision")
         return
 
     last_ev = prev_events[-1]
@@ -744,16 +767,26 @@ def _enforce_event_continuity(events: list, video_tag: str, stats: Optional[dict
 
 def _enforce_cross_chunk_continuity(
     current_events: list,
-    prev_events: list,
+    global_results: list,
     video_tag: str,
     stats: Optional[dict] = None,
 ) -> None:
     """跨 chunk 兜底：若当前 chunk events[0] 起点早于上段末 event 终点，吸附或丢弃。
 
-    必须在 _apply_prev_event_revision 之后调用（prev_events[-1].end_time 可能已被 revision 覆盖）。
+    从 global_results 末尾回溯，找到最后一个包含 events 的 chunk 作为"上段"进行比对。
     """
-    if not prev_events or not current_events:
+    if not current_events:
         return
+
+    prev_events = []
+    for chunk in reversed(global_results):
+        evts = (chunk.get("data") or {}).get("events", [])
+        if evts:
+            prev_events = evts
+            break
+    if not prev_events:
+        return
+
     prev_end_str = prev_events[-1].get("end_time", "")
     prev_end_sec = parse_timestamp_to_seconds(prev_end_str)
     if prev_end_sec <= 0:
@@ -925,7 +958,10 @@ def _resume_from_progress(
     anchor_start_str = events[-k].get("start_time", "")
     proposed = parse_timestamp_to_seconds_strict(anchor_start_str)
     if proposed is not None and 0 < proposed < last_end_sec:
-        return proposed, last_end_str, last_action, True, list(events[-k:])
+        max_overlap = float(cfg.max_overlap_duration_sec)
+        if last_end_sec - proposed > max_overlap:
+            proposed = last_end_sec - max_overlap
+        return proposed, last_end_str, last_action, True, _filter_overlap_events(events, proposed, last_end_sec)
     return last_end_sec, last_end_str, last_action, False, []
 
 
@@ -999,8 +1035,12 @@ def run_pass1(
                     if summ:
                         history_summaries.append(f"第{idx+1}段: {summ}")
 
-                last_chunk = global_results[-1].get("data") or {}
-                last_events = last_chunk.get("events", [])
+                last_events = []
+                for c in reversed(global_results):
+                    evts = (c.get("data") or {}).get("events", [])
+                    if evts:
+                        last_events = evts
+                        break
 
                 if last_events:
                     chunk_start, last_end_str, last_action, overlap_active, overlap_events = _resume_from_progress(last_events, cfg)
@@ -1123,96 +1163,165 @@ def run_pass1(
         )
 
         next_start = chunk_start + (cfg.chunk_duration_sec * 0.8)
+        content_attempt = 0
+        was_merged = False
 
-        try:
-            chunk_data = request_llm_with_retry(
-                client=client, model=cfg.model_name,
-                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
-                max_tokens=cfg.llm_max_tokens, temperature=cfg.llm_temperature,
-                max_retries=cfg.max_retries, chunk_name=log_tag,
-                token_tracker=token_tracker, stage=PASS_NAME,
-                force_json=True,
-            )
+        while True:
+            try:
+                messages = [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_content},
+                ]
+                chunk_data = request_llm_with_retry(
+                    client=client, model=cfg.model_name,
+                    messages=messages,
+                    max_tokens=cfg.llm_max_tokens, temperature=cfg.llm_temperature,
+                    max_retries=cfg.max_retries, chunk_name=log_tag,
+                    token_tracker=token_tracker, stage=PASS_NAME,
+                    force_json=True,
+                )
 
-            if cfg.pass1_timestamp_mode == "qwen_millisecond":
-                _normalize_qwen_output_timestamps(chunk_data, video_tag)
+                if cfg.pass1_timestamp_mode == "qwen_millisecond":
+                    _normalize_qwen_output_timestamps(chunk_data, video_tag)
 
-            _validate_and_snap_event_times(
-                chunk_data.get("events", []),
-                timestamps_str_list,
-                chunk_start, chunk_end,
-                video_tag,
-                confidence_stats,
-            )
-            _enforce_event_continuity(chunk_data.get("events", []), video_tag, confidence_stats)
+                _validate_and_snap_event_times(
+                    chunk_data.get("events", []),
+                    timestamps_str_list,
+                    chunk_start, chunk_end,
+                    video_tag,
+                    confidence_stats,
+                )
+                _enforce_event_continuity(chunk_data.get("events", []), video_tag, confidence_stats)
 
-            _validate_revision_end_time(
-                chunk_data.get("prev_event_revision"),
-                timestamps_str_list,
-                video_tag,
-                confidence_stats,
-            )
+                _validate_revision_end_time(
+                    chunk_data.get("prev_event_revision"),
+                    timestamps_str_list,
+                    video_tag,
+                    confidence_stats,
+                )
 
-            prev_events_before = (
-                (global_results[-1].get("data") or {}).get("events", [])
-                if global_results else []
-            )
-            _apply_prev_event_revision(chunk_data, global_results, video_tag)
+                revision_before = chunk_data.get("prev_event_revision")
+                was_merged = isinstance(revision_before, dict) and revision_before.get("need_merge")
 
-            _enforce_cross_chunk_continuity(
-                chunk_data.get("events", []),
-                prev_events_before,
-                video_tag,
-                confidence_stats,
-            )
-            _enforce_event_continuity(chunk_data.get("events", []), video_tag, confidence_stats)
+                _apply_prev_event_revision(chunk_data, global_results, video_tag)
 
-            global_results.append({"chunk_time_range": chunk_name, "data": chunk_data})
+                _enforce_cross_chunk_continuity(
+                    chunk_data.get("events", []),
+                    global_results,
+                    video_tag,
+                    confidence_stats,
+                )
+                _enforce_event_continuity(chunk_data.get("events", []), video_tag, confidence_stats)
 
-            with open(pass1_output_path, 'w', encoding='utf-8') as f:
-                json.dump(global_results, f, ensure_ascii=False, indent=2)
-            _write_pass1_confidence(run_dir, global_results, total_duration, confidence_stats)
+                events = chunk_data.get("events", [])
 
-            events = chunk_data.get("events", [])
+                if events or was_merged:
+                    break
 
-            if events:
-                new_summary = chunk_data.get('chunk_summary', '').strip()
-                if new_summary:
-                    history_summaries.append(f"第{len(history_summaries)+1}段: {new_summary}")
+                content_attempt += 1
+                if content_attempt > cfg.max_retries:
+                    _log(video_tag, f"❌ [内容重试] 已耗尽 {cfg.max_retries} 次重试，仍无事件且未合并，走 80% 兜底")
+                    break
+                _log(video_tag, f"⚠️ [内容重试] 第 {content_attempt}/{cfg.max_retries} 次：模型未输出事件且未触发合并，重试中...")
+                continue
 
-                pick = _pick_next_start(events, cfg, chunk_start, chunk_end)
-                if pick is not None:
-                    next_start, last_end_str, last_action, overlap_active, k_used = pick
-                    overlap_events = list(events[-k_used:]) if (overlap_active and k_used > 0) else []
-                    if overlap_active:
-                        _log(
-                            video_tag,
-                            f"🔁 [视觉重叠] N={cfg.prev_event_overlap_count}，下段 chunk_start 后退至 "
-                            f"{format_timestamp(next_start)}（含 {k_used} 个 event 回顾），打标起点 {last_end_str}。",
-                        )
-                    else:
-                        _log(video_tag, f"🔗 [动态接力] 本段动作自然结束于 {format_timestamp(next_start)}，以此为下段起点。")
-                    previous_context = _build_previous_context(
-                        history_summaries, last_action, last_end_str, next_start, overlap_active, overlap_events, cfg=cfg
+            except Exception as e:
+                if cfg.strict_failure:
+                    _log(video_tag, f"💥 [严格失败] Chunk {chunk_name} 多次尝试均失败: {e} → 终止本视频 Pass 1，跳过下游阶段。")
+                    raise
+                _log(video_tag, f"❌ [严重跳过] Chunk {chunk_name} 多次尝试均失败: {e}（strict_failure=False，继续下一段）")
+                chunk_data = {}
+                events = []
+                was_merged = False
+                break
+
+        chunk_entry = {"chunk_time_range": chunk_name, "data": chunk_data}
+        if was_merged and not chunk_data.get("events"):
+            chunk_entry["merged"] = True
+        global_results.append(chunk_entry)
+
+        with open(pass1_output_path, 'w', encoding='utf-8') as f:
+            json.dump(global_results, f, ensure_ascii=False, indent=2)
+        _write_pass1_confidence(run_dir, global_results, total_duration, confidence_stats)
+
+        if events:
+            new_summary = chunk_data.get('chunk_summary', '').strip()
+            if new_summary:
+                history_summaries.append(f"第{len(history_summaries)+1}段: {new_summary}")
+
+            pick = _pick_next_start(events, cfg, chunk_start, chunk_end)
+            if pick is not None:
+                next_start, last_end_str, last_action, overlap_active, k_used = pick
+                if overlap_active:
+                    overlap_end = parse_timestamp_to_seconds(events[-1].get("end_time", ""))
+                    overlap_events = _filter_overlap_events(events, next_start, overlap_end)
+                else:
+                    overlap_events = []
+                if overlap_active:
+                    _log(
+                        video_tag,
+                        f"🔁 [视觉重叠] N={cfg.prev_event_overlap_count}，下段 chunk_start 后退至 "
+                        f"{format_timestamp(next_start)}（前情提要 {overlap_end - next_start:.1f}s），打标起点 {last_end_str}。",
                     )
                 else:
-                    last_ev = events[-1]
-                    last_action = last_ev.get("step3_synthesized_dense_caption", "")
-                    last_end_str = last_ev.get("end_time", "")
-                    _log(video_tag, f"⚠️ [接力异常] 末尾时间不合理，启动 80% 安全重叠兜底推进。")
-                    previous_context = _build_previous_context(
-                        history_summaries, last_action, last_end_str, next_start, False, None, cfg=cfg
-                    )
+                    _log(video_tag, f"🔗 [动态接力] 本段动作自然结束于 {format_timestamp(next_start)}，以此为下段起点。")
+                previous_context = _build_previous_context(
+                    history_summaries, last_action, last_end_str, next_start, overlap_active, overlap_events, cfg=cfg
+                )
             else:
-                _log(video_tag, "⚠️ [接力异常] 未提取到事件，启动 80% 安全重叠兜底推进。")
+                last_ev = events[-1]
+                last_action = last_ev.get("step3_synthesized_dense_caption", "")
+                last_end_str = last_ev.get("end_time", "")
+                _log(video_tag, f"⚠️ [接力异常] 末尾时间不合理，启动 80% 安全重叠兜底推进。")
+                previous_context = _build_previous_context(
+                    history_summaries, last_action, last_end_str, next_start, False, None, cfg=cfg
+                )
+        elif was_merged:
+            prev_events = []
+            for c in reversed(global_results[:-1]):
+                evts = (c.get("data") or {}).get("events", [])
+                if evts:
+                    prev_events = evts
+                    break
+
+            if prev_events:
+                revised_last = prev_events[-1]
+                revised_end_str = revised_last.get("end_time", "")
+                revised_end_sec = parse_timestamp_to_seconds(revised_end_str)
+                last_action = revised_last.get("step3_synthesized_dense_caption", "")
+
+                pick = _pick_next_start(prev_events, cfg, chunk_start, chunk_end)
+                if pick is not None:
+                    next_start, last_end_str, _, overlap_active, _ = pick
+                    if overlap_active:
+                        overlap_events = _filter_overlap_events(prev_events, next_start, revised_end_sec)
+                    else:
+                        overlap_events = []
+                else:
+                    next_start = revised_end_sec
+                    last_end_str = revised_end_str
+                    overlap_active = False
+                    overlap_events = []
+
+                if next_start - chunk_start < cfg.min_chunk_advance_sec:
+                    _log(video_tag, f"⚠️ [合并推进] 修订后推进不足 ({next_start - chunk_start:.1f}s)，强制推进至 {format_timestamp(chunk_start + cfg.min_chunk_advance_sec)}")
+                    next_start = chunk_start + cfg.min_chunk_advance_sec
+                    overlap_active = False
+                    overlap_events = []
+                else:
+                    _log(video_tag, f"🔗 [合并接力] 本段完整合并至前段，修订后末尾事件结束于 {revised_end_str}，下段起点 {format_timestamp(next_start)}")
+
+                previous_context = _build_previous_context(
+                    history_summaries, last_action, last_end_str, next_start, overlap_active, overlap_events, cfg=cfg
+                )
+            else:
+                _log(video_tag, "⚠️ [合并异常] 未找到可回溯的前段事件，启动 80% 兜底")
                 prompt_next = _format_pass1_prompt_timestamp(next_start, cfg)
                 previous_context = f"【系统提示】: 上一片段解析异常，请直接从 {prompt_next} 开始重新捕捉动作。"
-
-        except Exception as e:
-            if cfg.strict_failure:
-                _log(video_tag, f"💥 [严格失败] Chunk {chunk_name} 多次尝试均失败: {e} → 终止本视频 Pass 1，跳过下游阶段。")
-                raise
-            _log(video_tag, f"❌ [严重跳过] Chunk {chunk_name} 多次尝试均失败: {e}（strict_failure=False，继续下一段）")
+        else:
+            _log(video_tag, "⚠️ [接力异常] 未提取到事件，启动 80% 安全重叠兜底推进。")
+            prompt_next = _format_pass1_prompt_timestamp(next_start, cfg)
+            previous_context = f"【系统提示】: 上一片段解析异常，请直接从 {prompt_next} 开始重新捕捉动作。"
 
         if chunk_end >= total_duration - 0.01:
             _log(video_tag, f"🏁 已处理到视频末尾 ({format_timestamp(total_duration)})，Pass 1 结束。")
