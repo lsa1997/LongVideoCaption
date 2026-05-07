@@ -1033,15 +1033,6 @@ def run_pass1(
 
     total_duration = float(get_video_duration(video_path))
 
-    precomputed_scenes = None
-    if cfg.frame_extraction_strategy == "scenedetect":
-        precomputed_scenes = detect_scenes(video_path, cfg.scene_detect_threshold)
-        _log(
-            video_tag,
-            f"📐 [pyscenedetect] 整片场景检测完成，共 {len(precomputed_scenes)} 个场景"
-            f"（阈值={cfg.scene_detect_threshold}），将作为各 chunk event 起止白名单。",
-        )
-
     global_results = []
     chunk_start = 0.0
     history_summaries = []
@@ -1056,14 +1047,20 @@ def run_pass1(
                 global_results = json.load(f)
 
             if global_results:
-                last_chunk_range = global_results[-1].get("chunk_time_range", "")
-                last_chunk_end_sec = None
-                if isinstance(last_chunk_range, str) and " - " in last_chunk_range:
-                    last_chunk_end_sec = parse_timestamp_to_seconds(
-                        last_chunk_range.split(" - ", 1)[1]
-                    )
+                # 用最后一个 event 的 end_time（已规范化为 hh:mm:ss.fff）判断是否已处理完，
+                # 避免 qwen_millisecond 模式下 chunk_name 里的 "xx.x seconds" 格式无法解析。
+                last_events = []
+                for c in reversed(global_results):
+                    evts = (c.get("data") or {}).get("events", [])
+                    if evts:
+                        last_events = evts
+                        break
 
-                if last_chunk_end_sec is not None and last_chunk_end_sec >= total_duration - 0.01:
+                last_end_sec = None
+                if last_events:
+                    last_end_sec = parse_timestamp_to_seconds_strict(last_events[-1].get("end_time", ""))
+
+                if last_end_sec is not None and last_end_sec >= total_duration - 0.01:
                     _log(video_tag, "\n=========================================")
                     _log(
                         video_tag,
@@ -1080,13 +1077,6 @@ def run_pass1(
                     summ = (res.get("data") or {}).get("chunk_summary", "")
                     if summ:
                         history_summaries.append(f"第{idx+1}段: {summ}")
-
-                last_events = []
-                for c in reversed(global_results):
-                    evts = (c.get("data") or {}).get("events", [])
-                    if evts:
-                        last_events = evts
-                        break
 
                 if last_events:
                     chunk_start, last_end_str, last_action, overlap_active, overlap_events = _resume_from_progress(last_events, cfg)
@@ -1108,6 +1098,16 @@ def run_pass1(
             global_results = []
             chunk_start = 0.0
             history_summaries = []
+
+    # 场景检测放到断点恢复之后，已完成视频可跳过，避免不必要的 pyscenedetect 开销。
+    precomputed_scenes = None
+    if cfg.frame_extraction_strategy == "scenedetect":
+        precomputed_scenes = detect_scenes(video_path, cfg.scene_detect_threshold)
+        _log(
+            video_tag,
+            f"📐 [pyscenedetect] 整片场景检测完成，共 {len(precomputed_scenes)} 个场景"
+            f"（阈值={cfg.scene_detect_threshold}），将作为各 chunk event 起止白名单。",
+        )
 
     while chunk_start < total_duration:
         chunk_end = min(chunk_start + cfg.chunk_duration_sec, total_duration)
