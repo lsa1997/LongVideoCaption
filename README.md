@@ -100,7 +100,7 @@ flowchart TB
 
 **关键不变量**：
 - events **首尾相连**逐字相等（`events[i+1].start_time == events[i].end_time`），由 prompt 强制约束。
-- 整片只跑一次 `pyscenedetect.detect`（`frame_extractor.detect_scenes`），结果在所有 chunk 间复用 —— 避免 N× 重复扫描。
+- 整片只跑一次 pyscenedetect（默认 `detect_scenes`，`--multiscale-detect` 启用时使用 `detect_scenes_multiscale`），结果在所有 chunk 间复用 —— 避免 N× 重复扫描。
 - `timestamps_whitelist` 来自当前 chunk 内的镜头切换时间点，并显式包含 `chunk_start` / `chunk_end`；重叠接力时还会加入上一段 `last_end`，确保模型只能选择可校验的边界。
 - **内容重试**：若 LLM 返回合法 JSON 但 `events` 为空且未触发 `prev_event_revision` 合并，则在同一 chunk 上重试（最多 `max_retries` 次），而非直接走 80% 兜底推进。
 - **跨 chunk 合并**：模型通过 `prev_event_revision`（含 `need_merge=true` + 修订后的 `end_time` / `step1` / `step2` / `step3`）将当前 chunk 的内容完整合并到前段末尾 event。合并后当前 chunk 标记 `merged: true`，其 `events` 为空。**支持单一 event 跨越 2 个以上 chunk 的连续合并**，所有跨 chunk 操作（revision 应用、连续性检查、断点恢复）均会回溯跳过 `merged` chunk，找到最后一个含 events 的 chunk 进行比对。
@@ -400,6 +400,9 @@ python main.py \
 | `--payload`       | `image_list` / `video_base64`            | `image_list`                 |
 | `--max-frames`    | 每 chunk 最大帧数                        | `360`                        |
 | `--scene-thresh`  | scenedetect 阈值                         | `15.0`                       |
+| `--multiscale-detect` | 启用 multiscale 场景检测（fast + slow 两遍检测） | `True`                       |
+| `--multiscale-fast-thresh` | multiscale fast 阈值（hard cuts）         | `22.0`                       |
+| `--multiscale-slow-thresh` | multiscale slow 阈值（fades / dissolves） | `14.0`                       |
 | `--frame-width`   | 帧宽（缩放上限）                         | `960`                        |
 | `--target-fps`    | video_base64 采样帧率                    | `1.0`                        |
 | `--pass1-timestamp-mode` | Pass 1 时间戳白名单格式：`second` / `millisecond` / `qwen_millisecond`（提示词用 `x.x seconds`，落盘仍为 `[hh:mm:ss.fff]`） | `second`                     |
@@ -415,6 +418,8 @@ python main.py \
 进阶超参（Stage 2/3 的 fps、max_frames、temperature、max_tokens 等）在 `longvideocaption/config.py` 的 `PipelineConfig` 里改默认值。Stage 2 并行相关参数包括 `stage2_parallel_max_workers`（非 qwen 最大并行请求数，默认 `4`）、`stage2_qwen_parallel_max_workers`（qwen 线程池安全上限，默认 `32`）和 `stage2_qwen_parallel_visual_token_budget`（qwen 同时在飞请求的视觉 token 预算，默认 `160 * 1024`）。
 
 Pass 1 相关进阶参数：`prev_event_overlap_count`（前情提要覆盖的末尾 event 个数，默认 `1`）、`max_overlap_duration_sec`（前情提要最大时长秒数，超过则截断，默认 `30.0`）、`min_chunk_advance_sec`（合并后 chunk_start 最小推进秒数，防止死循环，默认 `5.0`）。
+
+场景检测进阶参数：`multiscale_detect`（启用多时间尺度场景检测，默认 `True`）、`multiscale_fast_threshold`（fast pass 阈值，检测 hard cuts，默认 `22.0`）、`multiscale_slow_threshold`（slow pass 阈值，检测 fades/dissolves，默认 `14.0`）。启用 multiscale 后，fast pass 用零 frame_skip 配合较小的 min_scene_len 精细切分硬切，slow pass 用 frame_skip=5 配合较大的 min_scene_len 捕捉渐变转场，两遍结果合并去重后产出最终场景边界。
 
 ---
 

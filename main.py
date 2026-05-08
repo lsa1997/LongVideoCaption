@@ -45,6 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--payload", choices=["image_list", "video_base64"], default=None, help="覆盖 input_payload_format")
     p.add_argument("--max-frames", type=int, default=None, help="覆盖 max_frames_per_chunk")
     p.add_argument("--scene-thresh", type=float, default=None, help="覆盖 scene_detect_threshold")
+    p.add_argument("--multiscale-detect", action="store_true", default=None, help="启用 multiscale 场景检测（fast + slow 两遍检测）")
+    p.add_argument("--multiscale-fast-thresh", type=float, default=None, help="覆盖 multiscale_fast_threshold（hard cuts，默认 27.0）")
+    p.add_argument("--multiscale-slow-thresh", type=float, default=None, help="覆盖 multiscale_slow_threshold（fades/dissolves，默认 22.0）")
     p.add_argument("--frame-width", type=int, default=None, help="覆盖 frame_max_width")
     p.add_argument("--target-fps", type=float, default=None, help="覆盖 target_fps")
     p.add_argument(
@@ -104,6 +107,12 @@ def main(argv=None) -> int:
         cfg.max_frames_per_chunk = args.max_frames
     if args.scene_thresh is not None:
         cfg.scene_detect_threshold = args.scene_thresh
+    if args.multiscale_detect is not None:
+        cfg.multiscale_detect = args.multiscale_detect
+    if args.multiscale_fast_thresh is not None:
+        cfg.multiscale_fast_threshold = args.multiscale_fast_thresh
+    if args.multiscale_slow_thresh is not None:
+        cfg.multiscale_slow_threshold = args.multiscale_slow_thresh
     if args.frame_width is not None:
         cfg.frame_max_width = args.frame_width
     if args.target_fps is not None:

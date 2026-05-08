@@ -17,6 +17,9 @@ class PipelineConfig:
     frame_extraction_strategy: str = "scenedetect"
     max_frames_per_chunk: int = 360
     scene_detect_threshold: float = 15.0
+    multiscale_detect: bool = True
+    multiscale_fast_threshold: float = 22.0
+    multiscale_slow_threshold: float = 14.0
     target_fps: float = 1.0
     frame_max_width: int = 960
     max_total_pixels: int = 128 * 1024 * 32 * 32
@@ -80,7 +83,7 @@ class PipelineConfig:
 def hyper_signature(cfg: PipelineConfig) -> str:
     model = sanitize_filename(cfg.model_name)
     scene = str(cfg.scene_detect_threshold).replace(".", "_")
-    return (
+    base = (
         f"{model}"
         f"__chk{cfg.chunk_duration_sec}s"
         f"__{cfg.input_payload_format}"
@@ -90,3 +93,8 @@ def hyper_signature(cfg: PipelineConfig) -> str:
         f"__ts{cfg.pass1_timestamp_mode}"
         f"__ovlp{cfg.prev_event_overlap_count}"
     )
+    if cfg.multiscale_detect:
+        ms_fast = str(cfg.multiscale_fast_threshold).replace(".", "_")
+        ms_slow = str(cfg.multiscale_slow_threshold).replace(".", "_")
+        base += f"__msf{ms_fast}__mss{ms_slow}"
+    return base

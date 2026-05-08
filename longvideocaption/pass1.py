@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 from .config import PipelineConfig
 from .frame_extractor import (
     detect_scenes,
+    detect_scenes_multiscale,
     get_base64_frames,
     get_base64_frames_qwen,
     get_raw_chunk_video_base64,
@@ -1102,12 +1103,24 @@ def run_pass1(
     # 场景检测放到断点恢复之后，已完成视频可跳过，避免不必要的 pyscenedetect 开销。
     precomputed_scenes = None
     if cfg.frame_extraction_strategy == "scenedetect":
-        precomputed_scenes = detect_scenes(video_path, cfg.scene_detect_threshold)
-        _log(
-            video_tag,
-            f"📐 [pyscenedetect] 整片场景检测完成，共 {len(precomputed_scenes)} 个场景"
-            f"（阈值={cfg.scene_detect_threshold}），将作为各 chunk event 起止白名单。",
-        )
+        if cfg.multiscale_detect:
+            precomputed_scenes = detect_scenes_multiscale(
+                video_path,
+                fast_threshold=cfg.multiscale_fast_threshold,
+                slow_threshold=cfg.multiscale_slow_threshold,
+            )
+            _log(
+                video_tag,
+                f"📐 [pyscenedetect multiscale] 整片场景检测完成，共 {len(precomputed_scenes)} 个场景"
+                f"（fast={cfg.multiscale_fast_threshold}, slow={cfg.multiscale_slow_threshold}），将作为各 chunk event 起止白名单。",
+            )
+        else:
+            precomputed_scenes = detect_scenes(video_path, cfg.scene_detect_threshold)
+            _log(
+                video_tag,
+                f"📐 [pyscenedetect] 整片场景检测完成，共 {len(precomputed_scenes)} 个场景"
+                f"（阈值={cfg.scene_detect_threshold}），将作为各 chunk event 起止白名单。",
+            )
 
     while chunk_start < total_duration:
         chunk_end = min(chunk_start + cfg.chunk_duration_sec, total_duration)
@@ -1138,6 +1151,9 @@ def run_pass1(
                 cfg.frame_extraction_strategy, cfg.scene_detect_threshold, cfg.max_frames_per_chunk,
                 log_prefix=f"[{video_tag}] " if video_tag else "",
                 precomputed_scenes=precomputed_scenes,
+                use_multiscale=cfg.multiscale_detect,
+                multiscale_fast_threshold=cfg.multiscale_fast_threshold,
+                multiscale_slow_threshold=cfg.multiscale_slow_threshold,
             )
             if 'qwen' in cfg.model_name:
                 valid_timestamps, base64_frames = get_base64_frames_qwen(

@@ -5,16 +5,155 @@ from typing import List, Optional, Tuple
 import math
 import cv2
 import numpy as np
+from scenedetect import open_video, detect, SceneManager
+from scenedetect.detectors import ContentDetector
 
 from .utils import format_timestamp
 
 
 def detect_scenes(video_path: str, threshold: float) -> List[Tuple[float, float]]:
     """整片跑一次 pyscenedetect，返回 [(s_start_sec, s_end_sec), ...]。"""
-    from scenedetect import detect, ContentDetector
 
     raw = detect(video_path, ContentDetector(threshold=threshold))
     return [(scene[0].get_seconds(), scene[1].get_seconds()) for scene in raw]
+
+Scene = Tuple[float, float]
+
+def detect_scenes_multiscale(
+    video_path: str,
+    fast_threshold: float = 27.0,
+    slow_threshold: float = 22.0,
+    min_scene_len_fast: int = 5,
+    min_scene_len_slow: int = 20,
+    frame_skip_fast: int = 0,
+    frame_skip_slow: int = 5,
+    merge_distance: float = 0.5,
+    min_scene_duration: float = 0.5,
+) -> List[Scene]:
+    """
+    多时间尺度 scene detection:
+
+    pass1:
+        小 frame_skip
+        检测 hard cut
+
+    pass2:
+        大 frame_skip
+        检测 fade / dissolve
+
+    最后 merge boundary。
+
+    Returns:
+        [(start_sec, end_sec), ...]
+    """
+
+    # ---------------------------------------------------
+    # 内部函数：跑一次 detector
+    # ---------------------------------------------------
+    def run_detector(
+        frame_skip: int,
+        threshold: float,
+        min_scene_len: int,
+    ) -> List[Scene]:
+
+        video = open_video(video_path)
+
+        manager = SceneManager()
+        manager.auto_downscale = True
+
+        manager.add_detector(
+            ContentDetector(
+                threshold=threshold,
+                min_scene_len=min_scene_len,
+                weights=ContentDetector.Components(
+                    delta_hue=1.0,
+                    delta_sat=1.0,
+                    delta_lum=1.0,
+                    delta_edges=0.0,  # 提速
+                ),
+            )
+        )
+
+        manager.detect_scenes(
+            video,
+            frame_skip=frame_skip,
+        )
+
+        scenes = manager.get_scene_list()
+
+        return [
+            (
+                s[0].get_seconds(),
+                s[1].get_seconds(),
+            )
+            for s in scenes
+        ]
+
+    # ---------------------------------------------------
+    # pass1: hard cuts
+    # ---------------------------------------------------
+    scenes_fast = run_detector(
+        frame_skip=frame_skip_fast,
+        threshold=fast_threshold,
+        min_scene_len=min_scene_len_fast,
+    )
+
+    # ---------------------------------------------------
+    # pass2: fades / dissolves
+    # ---------------------------------------------------
+    scenes_slow = run_detector(
+        frame_skip=frame_skip_slow,
+        threshold=slow_threshold,
+        min_scene_len=min_scene_len_slow,
+    )
+
+    # ---------------------------------------------------
+    # 提取 boundary
+    # ---------------------------------------------------
+    boundaries = set()
+
+    for scenes in [scenes_fast, scenes_slow]:
+        for start, _ in scenes:
+            boundaries.add(round(start, 3))
+
+    boundaries = sorted(boundaries)
+
+    # ---------------------------------------------------
+    # merge nearby boundaries
+    # ---------------------------------------------------
+    merged_boundaries = []
+
+    for t in boundaries:
+
+        if not merged_boundaries:
+            merged_boundaries.append(t)
+            continue
+
+        prev = merged_boundaries[-1]
+
+        # boundary 很近 -> 合并
+        if abs(t - prev) <= merge_distance:
+            merged_boundaries[-1] = (prev + t) / 2.0
+        else:
+            merged_boundaries.append(t)
+
+    # ---------------------------------------------------
+    # boundary -> scenes
+    # ---------------------------------------------------
+    scenes_final = []
+
+    for i in range(len(merged_boundaries) - 1):
+
+        start = merged_boundaries[i]
+        end = merged_boundaries[i + 1]
+
+        # 过滤超短 scene
+        if (end - start) < min_scene_duration:
+            continue
+
+        scenes_final.append((start, end))
+
+    return scenes_final
 
 
 def get_target_timestamps(
@@ -26,11 +165,21 @@ def get_target_timestamps(
     max_frames: int,
     log_prefix: str = "",
     precomputed_scenes: Optional[List[Tuple[float, float]]] = None,
+    use_multiscale: bool = False,
+    multiscale_fast_threshold: float = 27.0,
+    multiscale_slow_threshold: float = 22.0,
 ) -> List[float]:
     print(f"\n{log_prefix}[序列构建] 分析 {format_timestamp(chunk_start)} 到 {format_timestamp(chunk_end)}。策略: {strategy}")
     if strategy == "scenedetect":
         if precomputed_scenes is None:
-            scene_list_raw = detect_scenes(video_path, threshold)
+            if use_multiscale:
+                scene_list_raw = detect_scenes_multiscale(
+                    video_path,
+                    fast_threshold=multiscale_fast_threshold,
+                    slow_threshold=multiscale_slow_threshold,
+                )
+            else:
+                scene_list_raw = detect_scenes(video_path, threshold)
         else:
             scene_list_raw = precomputed_scenes
 
