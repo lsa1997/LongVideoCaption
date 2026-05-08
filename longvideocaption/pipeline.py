@@ -107,18 +107,19 @@ def process_single_video(cfg: PipelineConfig, video_path: str, output_root: str)
     run_dir = resolve_run_dir(cfg, video_path, output_root)
 
     # stage2-only / stage3-only 时定位前序阶段产物所在目录
+    read_dir = run_dir
     if cfg.stage2_only or cfg.stage3_only:
         filename = "stage2_refined.json" if cfg.stage3_only else "pass3_final.json"
         video_base_dir = os.path.join(output_root, video_tag)
         previous_dir = _resolve_previous_stage_dir(
             video_base_dir, run_dir, filename, cfg.hyper_sig_override,
         )
+        read_dir = previous_dir
         if previous_dir != run_dir:
             print(
                 f"🔍 [{video_tag}] 前序阶段产物位于: {previous_dir}\n"
                 f"   当前 hyper_sig: {hyper_signature(cfg)}"
             )
-            run_dir = previous_dir
 
     os.makedirs(run_dir, exist_ok=True)
 
@@ -170,7 +171,7 @@ def process_single_video(cfg: PipelineConfig, video_path: str, output_root: str)
 
         # ── Stage 3 only：跳过 Stage 1 + Stage 2 ──
         if cfg.stage3_only:
-            stage2_path = os.path.join(run_dir, "stage2_refined.json")
+            stage2_path = os.path.join(read_dir, "stage2_refined.json")
             if not os.path.exists(stage2_path):
                 raise FileNotFoundError(
                     f"stage3_only 需要 stage2_refined.json，但未找到: {stage2_path}"
@@ -179,7 +180,10 @@ def process_single_video(cfg: PipelineConfig, video_path: str, output_root: str)
             print(f"⏭️  [{video_tag}] stage3_only=True，跳过 Stage 1 / Stage 2。")
 
             with tracker.stage_timer("stage3_global_polish"):
-                stage3_path = run_stage3(cfg, stage2_path, run_dir, client, tracker, video_tag=video_tag)
+                stage3_path = run_stage3(
+                    cfg, stage2_path, run_dir, client, tracker,
+                    video_tag=video_tag, read_dir=read_dir,
+                )
             result["artifacts"]["stage3_polished"] = stage3_path
 
             this_run["status"] = "completed"
@@ -188,7 +192,7 @@ def process_single_video(cfg: PipelineConfig, video_path: str, output_root: str)
 
         # ── Stage 2 only：跳过 Stage 1 ──
         if cfg.stage2_only:
-            final_path = os.path.join(run_dir, "pass3_final.json")
+            final_path = os.path.join(read_dir, "pass3_final.json")
             if not os.path.exists(final_path):
                 raise FileNotFoundError(
                     f"stage2_only 需要 pass3_final.json，但未找到: {final_path}"

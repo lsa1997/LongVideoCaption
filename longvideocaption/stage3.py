@@ -453,6 +453,7 @@ def run_stage3(
     client,
     token_tracker: TokenTracker = None,
     video_tag: str = "",
+    read_dir: str = "",
 ) -> str:
     os.makedirs(run_dir, exist_ok=True)
     lang = (cfg.output_language or "zh").lower()
@@ -482,7 +483,7 @@ def run_stage3(
             json.dump(cloned, f, ensure_ascii=False, indent=2)
         return out_path
 
-    character_roster = _load_character_roster(run_dir) if lang == "en" else []
+    character_roster = _load_character_roster(read_dir or run_dir) if lang == "en" else []
 
     _log(video_tag, "\n" + "=" * 50)
     total_events = sum(len(ch['events']) for ch in payload['chapters'])
