@@ -16,7 +16,7 @@ import os
 
 from .config import PipelineConfig
 from .llm_client import request_llm_with_retry
-from .prompts.stage3_v1 import SYS_PROMPT_STAGE3, build_stage3_user_prompt
+from .prompts.stage3_v2 import SYS_PROMPT_STAGE3, build_stage3_user_prompt
 from .prompts.stage3_v1_en import SYS_PROMPT_STAGE3_EN, build_stage3_user_prompt_en
 from .token_tracker import TokenTracker
 
