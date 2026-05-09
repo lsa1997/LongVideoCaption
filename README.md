@@ -171,7 +171,7 @@ flowchart TB
 
 每次运行都会落 `_debug_pass3_input.txt` 与 `_debug_pass3_chapter_response.json` 用于排错，并生成 `pass3_confidence.json` 记录章节结构、时间有效性、边界吸附、event 挂载和章节分布。
 
-**`characters_in_event` 抽取**：从 `step3_synthesized_dense_caption` 用 `\[[^\[\]]+\]` 正则抓 `[xxx]`，并丢弃形如 `[00:04:41]` / `[3.14]` 这类纯数字/冒号/小数点构成的"伪角色"（即时间戳），避免把时间戳错当成角色名落到 `event.characters` 里。
+**`characters_in_event` 抽取**：从 `step3_synthesized_dense_caption` 用 `\[[^\[\]]+\]` 正则抓 `[xxx]`，并丢弃形如 `[00:04:41]` / `[3.14]` 这类纯数字/冒号/小数点构成的"伪角色"，以及包含 `second` 的字符串（如 `[30 seconds]`），避免把时间戳错当成角色名落到 `event.characters` 里。
 
 ---
 

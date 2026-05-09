@@ -26,7 +26,7 @@ def _extract_event_characters(step3_text: str, name_to_desc: dict) -> list:
     seen = []
     for name in _ROLE_PATTERN.findall(step3_text):
         inner = name[1:-1]
-        if _TIMESTAMP_LIKE.match(inner):
+        if _TIMESTAMP_LIKE.match(inner) or "second" in inner:
             continue
         if name not in seen:
             seen.append(name)
